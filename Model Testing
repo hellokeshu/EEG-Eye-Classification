@@ -1,0 +1,240 @@
+**First Model**
+
+Using 50 subjects each with 610 data points using 75/25 stratified split with random forest model.
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install mne numpy scipy scikit-learn
+
+
+import os
+import numpy as np
+import mne
+from glob import glob
+
+from scipy.signal import welch
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+!pip install seaborn
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import confusion_matrix
+
+
+DATA_DIR = "/content/drive/MyDrive/eeg_eyes_project"
+
+
+import mne
+import numpy as np
+from scipy.signal import welch
+
+WAVE_BANDS = {
+    "delta_wave": (1, 4),
+    "theta_wave": (4, 8),
+    "alpha_wave": (8, 13),
+    "beta_wave":  (13, 30)
+}
+
+def load_and_prep(path_to_data, L_FREQ=1.0, H_FREQ=40.0):
+    raw_sig = mne.io.read_raw_edf(path_to_data, preload=True, verbose=False)
+    raw_sig.filter(l_freq=L_FREQ, h_freq=H_FREQ, verbose=False) # Apply bandpass filter
+    return raw_sig
+
+def slice_into_segments(raw_sig, window_size_sec=1.0):
+    fs = raw_sig.info['sfreq']
+    samples_per_seg = int(window_size_sec * fs)
+    data_array = raw_sig.get_data()
+    n_ch, n_samples = data_array.shape
+
+    N_SEGS = n_samples // samples_per_seg
+    if N_SEGS == 0:
+        return None # Data too short
+
+    data_array = data_array[:, :N_SEGS * samples_per_seg]
+
+    segs = data_array.reshape(n_ch, N_SEGS, samples_per_seg)
+    segs = np.transpose(segs, (1, 0, 2))
+    return segs
+
+
+def calculate_band_power(segment_data, fs, band_limits):
+    low_f, high_f = band_limits
+    n_ch, _ = segment_data.shape
+    power_values = np.zeros(n_ch)
+
+    for ch_idx in range(n_ch):
+        f, psd = welch(segment_data[ch_idx], fs, nperseg=min(256, segment_data.shape[1]))
+        idx = (f >= low_f) & (f <= high_f)
+        power_values[ch_idx] = np.trapz(psd[idx], f[idx]) # Integrate the PSD
+
+    return power_values
+
+def extract_all_features(segments, fs):
+    n_segs, n_ch, _ = segments.shape
+    # Setup final array X
+    X_out = np.zeros((n_segs, n_ch * len(WAVE_BANDS)))
+
+    band_list_values = list(WAVE_BANDS.values())
+
+    for i in range(n_segs):
+        segment_features = []
+        for limits in band_list_values:
+            bp = calculate_band_power(segments[i], fs, limits)
+            segment_features.append(bp)
+
+        X_out[i] = np.concatenate(segment_features) # Stack channel powers
+
+    return X_out
+
+def build_dataset(data_dir, window_sec=1.0):
+    X_list = []
+    y_list = []
+
+    files = sorted(glob(os.path.join(data_dir, "*.edf")))
+    print("Found", len(files), "EDF files") # Report file count
+
+    for fpath in files:
+        fname = os.path.basename(fpath)
+
+        if "R01" in fname:
+            label = 0  # Eyes open label
+        elif "R02" in fname:
+            label = 1  # Eyes closed label
+        else:
+            continue
+
+        print("Processing", fname, "Label =", label)
+
+        raw = load_and_prep(fpath)
+        sfreq = raw.info['sfreq']
+
+        windows = slice_into_segments(raw, window_sec)
+
+        if windows is None:
+            # Check if the file was too short after trimming.
+            print("Skipping:", fname, "(too short)")
+            continue
+
+        X_feats = extract_all_features(windows, sfreq)
+
+        y_feats = np.full(X_feats.shape[0], label) # Create label vector
+
+
+        X_list.append(X_feats)
+        y_list.append(y_feats)
+
+
+    X = np.vstack(X_list) # Stack all features
+
+    y = np.concatenate(y_list) # Concatenate all labels
+
+    return X, y
+
+X, y = build_dataset(DATA_DIR, window_sec=1.0)
+
+print("Final X shape:", X.shape)
+print("Final y shape:", y.shape)
+print("Class counts:", np.bincount(y))
+
+X_train_data, X_test_data, y_train_labels, y_test_labels = train_test_split(
+    X, y,
+    test_size=0.25,
+    stratify=y,
+    random_state=42
+)
+
+clf_model = RandomForestClassifier(
+    n_estimators=300, # number of trees
+    max_depth=None,
+    random_state=42,
+    n_jobs=-1
+)
+
+clf_model.fit(X_train_data, y_train_labels)
+
+# predictions on unseen data
+y_predictions = clf_model.predict(X_test_data)
+
+
+print("\nClassification Performance:")
+print(classification_report(y_test_labels, y_predictions))
+
+print("\nConfusion Matrix (True vs Predicted)")
+print(confusion_matrix(y_test_labels, y_predictions))
+
+importances = clf_model.feature_importances_
+plt.figure(figsize=(12,4))
+plt.plot(importances)
+plt.title("Random Forest Feature Importances")
+plt.xlabel("Feature Index")
+plt.ylabel("Importance")
+plt.show()
+
+
+cm = confusion_matrix(y_test_labels, y_predictions)
+
+plt.figure(figsize=(4, 3))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Open", "Closed"],
+            yticklabels=["Open", "Closed"])
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix: Eyes Open vs Eyes Closed")
+plt.tight_layout()
+plt.show()
+
+
+y_proba = clf_model.predict_proba(X_test_data)[:, 1]
+
+fpr, tpr, thresholds = roc_curve(y_test_labels, y_proba)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(5,4))
+plt.plot(fpr, tpr, label=f"ROC curve (AUC = {roc_auc:.2f})")
+plt.plot([0,1], [0,1], linestyle="--", label="Chance")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve for Eyes-Closed Detection")
+plt.legend(loc="lower right")
+plt.tight_layout()
+plt.show()
+
+
+n_bands = len(WAVE_BANDS)
+n_channels = X.shape[1] // n_bands
+band_names = list(WAVE_BANDS.keys())
+alpha_idx = band_names.index("alpha_wave")
+
+start = alpha_idx * n_channels
+end   = (alpha_idx + 1) * n_channels
+
+alpha_feats = X[:, start:end]
+
+open_alpha   = alpha_feats[y == 0].mean(axis=0)
+closed_alpha = alpha_feats[y == 1].mean(axis=0)
+
+plt.figure(figsize=(10,4))
+plt.plot(open_alpha,   marker="o", label="Eyes Open")
+plt.plot(closed_alpha, marker="o", label="Eyes Closed")
+plt.xlabel("Channel Index")
+plt.ylabel("Mean Alpha Power (a.u.)")
+plt.title("Average Alpha Power Across Channels")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+#kNN Accuracy
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import accuracy_score
+
+knn = KNeighborsClassifier(n_neighbors=best_k)
+knn.fit(X_train, y_train)
+
+y_pred_knn = knn.predict(X_test)
+knn_accuracy = accuracy_score(y_test, y_pred_knn)
+
+print(knn_accuracy)
